@@ -1,9 +1,12 @@
-# Pocket Option Trading Bot
+# Pocket Option Signal Bot
 
-Automated trading bot for Pocket Option with real-time WebSocket data, multi-timeframe technical analysis, and Telegram notifications.
+**Signal-only bot** for Pocket Option with real-time WebSocket data, multi-timeframe technical analysis, and Telegram notifications.
+
+> ⚠️ **This bot generates trading signals only. It does NOT execute trades automatically.** You receive signals via Telegram and decide whether to act on them.
 
 ## Features
 
+- **Signal Only (No Auto-Trading)**: Generates BUY/SELL signals with confidence scores, SL/TP, risk:reward — you decide to trade
 - **Real-time WebSocket Connection**: Connects to Pocket Option via Playwright browser automation to capture live WebSocket endpoints
 - **Multi-timeframe Candles**: Builds 1s, 5s, 15s, 1m, 5m candles from raw ticks
 - **10 Technical Indicators**: RSI, MACD, Bollinger Bands, ATR, Stochastic, ADX, CCI, Williams %R, SMA, EMA
@@ -61,7 +64,7 @@ const config: BotConfig = {
     isDemo: true,
     assets: ['EUR/USD OTC', 'GBP/USD OTC', 'USD/JPY OTC'],
     headless: true,
-    mockMode: true,  // Set false for live
+    mockMode: true,  // Set false for live signals
   },
   signalEngine: {
     minConfidence: 70,
@@ -73,10 +76,12 @@ const config: BotConfig = {
     botToken: process.env.TELEGRAM_BOT_TOKEN!,
     chatId: process.env.TELEGRAM_CHAT_ID!,
   },
-  autoTrade: false,
+  autoTrade: false,  // SIGNAL ONLY - never executes trades
   logLevel: 'info'
 };
 ```
+
+> **Note**: `autoTrade: false` is hardcoded as default. This bot only sends signals to Telegram — you manually execute trades on Pocket Option platform.
 
 ## Telegram Commands
 
