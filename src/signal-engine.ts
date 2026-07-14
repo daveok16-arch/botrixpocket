@@ -47,10 +47,9 @@ export interface Signal {
   pattern?: string;
   confidence: number;
   expiry: number;
+  expirationTime: number;  // milliseconds from now (e.g., 60000 = 1 min, 300000 = 5 min)
+  expirationLabel: string;  // human readable (e.g., "1m", "5m", "15m")
   timeframe: string;
-  riskReward: number;
-  stopLoss: number;
-  takeProfit: number;
 }
 
 export interface EngineConfig {
@@ -562,10 +561,17 @@ export class SignalEngine extends EventEmitter {
 
     if (confidence < this.config.minConfidence) return null;
 
-    const atr = indicators.atr;
-    const stopLoss = type === 'BUY' ? tick.price - (atr * 1.5) : tick.price + (atr * 1.5);
-    const takeProfit = type === 'BUY' ? tick.price + (atr * 3) : tick.price - (atr * 3);
-    const riskReward = Math.abs(takeProfit - tick.price) / Math.abs(tick.price - stopLoss);
+    // Determine expiration based on timeframe and confidence
+    // Higher confidence = longer expiration (more time for move to play out)
+    const primaryTimeframe = this.config.timeframes[this.config.timeframes.length - 1];
+    const tfMs = this.getTimeframeMs(primaryTimeframe);
+    
+    // Base expiration: 2-3 candles of primary timeframe
+    // Adjust by confidence: higher confidence = slightly longer
+    const baseExpirationMultiplier = confidence >= 85 ? 3 : confidence >= 75 ? 2.5 : 2;
+    const expirationMs = Math.round(tfMs * baseExpirationMultiplier);
+    const expirationTime = tick.timestamp + expirationMs;
+    const expirationLabel = this.formatExpiration(expirationMs);
 
     const signal: Signal = {
       id: `sig_${++this.signalId}_${Date.now()}`,
@@ -578,14 +584,31 @@ export class SignalEngine extends EventEmitter {
       conditions,
       pattern: patterns.join(', ') || undefined,
       confidence,
-      expiry: tick.timestamp + 300000,
-      timeframe: this.config.timeframes[this.config.timeframes.length - 1],
-      riskReward: Math.round(riskReward * 100) / 100,
-      stopLoss: Math.round(stopLoss * 100000) / 100000,
-      takeProfit: Math.round(takeProfit * 100000) / 100000
+      expiry: expirationTime,
+      expirationTime: expirationMs,
+      expirationLabel,
+      timeframe: primaryTimeframe
     };
 
     return signal;
+  }
+
+  private getTimeframeMs(timeframe: string): number {
+    const map: Record<string, number> = {
+      '1s': 1000,
+      '5s': 5000,
+      '15s': 15000,
+      '1m': 60000,
+      '5m': 300000
+    };
+    return map[timeframe] || 60000;
+  }
+
+  private formatExpiration(ms: number): string {
+    if (ms >= 300000) return `${ms / 60000}m`;
+    if (ms >= 60000) return `${ms / 60000}m`;
+    if (ms >= 1000) return `${ms / 1000}s`;
+    return `${ms}ms`;
   }
 
   private countMetConditions(conditions: SignalConditions): number {

@@ -161,7 +161,8 @@ export class PocketOptionBot extends EventEmitter {
 
   private handleSignal(signal: Signal): void {
     this.signalCount++;
-    this.log('info', `🚀 SIGNAL #${this.signalCount}: ${signal.type} ${signal.asset} @ ${signal.price} | Conf: ${signal.confidence}% | R:R ${signal.riskReward} | SL: ${signal.stopLoss} | TP: ${signal.takeProfit}`);
+    const timeToExpiry = Math.round((signal.expiry - Date.now()) / 60000);
+    this.log('info', `🚀 SIGNAL #${this.signalCount}: ${signal.type} ${signal.asset} @ ${signal.price} | Conf: ${signal.confidence}% | Expiry: ${signal.expirationLabel} (${timeToExpiry}min)`);
     
     // Send Telegram notification
     if (this.telegram?.isEnabled()) {

@@ -70,16 +70,18 @@ bot.on('tick', (tick) => {
 });
 
 bot.on('signal', (signal) => {
+  const timeToExpiry = Math.round((signal.expiry - Date.now()) / 1000 / 60);
+  const expiryTime = new Date(signal.expiry);
   console.log(`\n🚨 SIGNAL: ${signal.type} ${signal.asset}`);
   console.log(`   Price: ${signal.price}`);
   console.log(`   Confidence: ${signal.confidence}%`);
   console.log(`   Pattern: ${signal.pattern || 'N/A'}`);
   console.log(`   RSI: ${signal.indicators.rsi.toFixed(2)}`);
   console.log(`   MACD: ${signal.indicators.macd.macd.toFixed(5)} / ${signal.indicators.macd.signal.toFixed(5)}`);
-  console.log(`   BB: ${signal.indicators.bollinger.lower.toFixed(5)} - ${signal.indicators.bollinger.middle.toFixed(5)} - ${signal.indicators.bollinger.upper.toFixed(5)}`);
   console.log(`   ADX: ${signal.indicators.adx.toFixed(2)} | CCI: ${signal.indicators.cci.toFixed(2)} | Williams %R: ${signal.indicators.williamsR.toFixed(2)}`);
-  console.log(`   Risk:Reward: ${signal.riskReward} | SL: ${signal.stopLoss} | TP: ${signal.takeProfit}`);
-  console.log(`   Timeframe: ${signal.timeframe} | Expiry: ${new Date(signal.expiry).toISOString()}\n`);
+  console.log(`   ⏱ Timeframe: ${signal.timeframe}`);
+  console.log(`   🕐 Expiration: ${signal.expirationLabel} (${timeToExpiry} min)`);
+  console.log(`   ⏰ Expires at: ${expiryTime.toLocaleTimeString()}\n`);
 });
 
 bot.on('error', (error: Error) => {

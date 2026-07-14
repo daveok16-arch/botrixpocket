@@ -136,16 +136,16 @@ export class TelegramNotifier {
 
     const emoji = signal.type === 'BUY' ? '🟢' : '🔴';
     const trendEmoji = this.getTrendEmoji(signal.indicators);
+    const expiryTime = new Date(signal.expiry);
+    const timeToExpiry = Math.round((signal.expiry - Date.now()) / 1000 / 60);
     
     const message = 
       `${emoji} <b>${signal.type} ${signal.asset}</b> ${trendEmoji}\n\n` +
       `💰 <b>Price:</b> ${signal.price.toFixed(5)}\n` +
       `🎯 <b>Confidence:</b> ${signal.confidence}%\n` +
-      `📊 <b>Risk:Reward:</b> ${signal.riskReward}\n` +
-      `🛑 <b>Stop Loss:</b> ${signal.stopLoss.toFixed(5)}\n` +
-      `🎯 <b>Take Profit:</b> ${signal.takeProfit.toFixed(5)}\n` +
       `⏱ <b>Timeframe:</b> ${signal.timeframe}\n` +
-      `🕐 <b>Expiry:</b> ${new Date(signal.expiry).toLocaleTimeString()}\n\n` +
+      `🕐 <b>Expiration:</b> ${signal.expirationLabel} (${timeToExpiry} min)\n` +
+      `⏰ <b>Expiry at:</b> ${expiryTime.toLocaleTimeString()}\n\n` +
       `<b>Indicators:</b>\n` +
       `• RSI: ${signal.indicators.rsi.toFixed(1)}\n` +
       `• MACD: ${signal.indicators.macd.macd.toFixed(5)} / ${signal.indicators.macd.signal.toFixed(5)}\n` +
