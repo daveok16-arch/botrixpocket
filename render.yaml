@@ -15,9 +15,5 @@ services:
         sync: false
       - key: POCKET_PASSWORD
         sync: false
-      - key: POCKET_TOKEN
-        sync: false
-      - key: POCKET_USER_ID
-        sync: false
     healthCheckPath: /health
     autoDeploy: true

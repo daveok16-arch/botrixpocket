@@ -28,6 +28,11 @@ export interface PocketOptionConfig {
   headless?: boolean;
   slowMo?: number;
   mockMode?: boolean;
+  // Auth retry configuration
+  maxLoginRetries?: number;
+  maxAuthRetries?: number;
+  loginRetryDelay?: number;
+  authRetryDelay?: number;
 }
 
 export interface WsMessage {
@@ -57,7 +62,6 @@ export class PocketOptionClient extends EventEmitter {
   private maxReconnectAttempts = 10;
   private reconnectDelay = 5000;
   private config: PocketOptionConfig;
-  private messageId = 0;
 
   constructor(config: PocketOptionConfig) {
     super();
@@ -70,7 +74,11 @@ export class PocketOptionClient extends EventEmitter {
       password: config.password,
       token: config.token,
       userId: config.userId,
-      mockMode: config.mockMode ?? false
+      mockMode: config.mockMode ?? false,
+      maxLoginRetries: config.maxLoginRetries ?? 3,
+      maxAuthRetries: config.maxAuthRetries ?? 3,
+      loginRetryDelay: config.loginRetryDelay ?? 5000,
+      authRetryDelay: config.authRetryDelay ?? 3000
     };
     this.assets = this.config.assets || ['EUR/USD OTC'];
   }
@@ -339,19 +347,55 @@ export class PocketOptionClient extends EventEmitter {
   }
 
   private async authenticate(): Promise<void> {
-    if (!this.config.token || !this.config.userId) {
-      console.log('[Auth] No token/userId provided, attempting to extract from browser...');
-      await this.extractAuthFromBrowser();
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= this.config.maxAuthRetries!; attempt++) {
+      console.log(`[Auth] Attempt ${attempt}/${this.config.maxAuthRetries}...`);
+
+      if (!this.config.token || !this.config.userId) {
+        console.log('[Auth] No token/userId provided, attempting to extract from browser...');
+        await this.extractAuthFromBrowser();
+      }
+
+      if (!this.authPayload) {
+        lastError = new Error('[Auth] Failed to extract authentication from browser after login');
+        
+        // Try to re-login if we have credentials
+        if (this.config.email && this.config.password && !this.config.isDemo) {
+          console.log(`[Auth] Attempting re-login (attempt ${attempt})...`);
+          await this.performLoginWithRetry(attempt);
+          await this.extractAuthFromBrowser();
+          
+          if (this.authPayload) {
+            console.log('[Auth] Successfully extracted auth after re-login');
+            break;
+          }
+        }
+        
+        if (attempt < this.config.maxAuthRetries!) {
+          console.log(`[Auth] Retrying in ${this.config.authRetryDelay}ms...`);
+          await this.sleep(this.config.authRetryDelay!);
+          continue;
+        }
+      } else {
+        console.log('[Auth] Auth payload ready, attempting WebSocket authentication...');
+        break;
+      }
     }
 
     if (!this.authPayload) {
-      throw new Error('Authentication failed: No auth payload available');
+      throw new Error(
+        `[Auth] Failed after ${this.config.maxAuthRetries} attempts. ` +
+        `Last error: ${lastError?.message || 'No auth payload available'}. ` +
+        `Ensure POCKET_EMAIL and POCKET_PASSWORD are set correctly, ` +
+        `and the demo/live account is accessible.`
+      );
     }
 
     const payload = this.authPayload;
 
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Auth timeout')), 10000);
+      const timeout = setTimeout(() => reject(new Error('Auth timeout: Server did not respond')), 15000);
 
       const handleAuth = (data: Buffer) => {
         const msg = data.toString();
@@ -366,7 +410,7 @@ export class PocketOptionClient extends EventEmitter {
         } else if (msg.includes('"error"') || msg.includes('"unauthorized"')) {
           clearTimeout(timeout);
           this.ws!.off('message', handleAuth);
-          reject(new Error('Authentication failed: ' + msg));
+          reject(new Error(`Authentication rejected by server: ${msg}`));
         }
       };
 
@@ -385,20 +429,84 @@ export class PocketOptionClient extends EventEmitter {
     });
   }
 
+  private async performLoginWithRetry(attempt: number): Promise<void> {
+    for (let loginAttempt = 1; loginAttempt <= this.config.maxLoginRetries!; loginAttempt++) {
+      console.log(`[Login] Attempt ${loginAttempt}/${this.config.maxLoginRetries}...`);
+      
+      try {
+        await this.performLogin();
+        
+        // Wait for login to process and page to load
+        await this.page!.waitForTimeout(this.config.loginRetryDelay!);
+        
+        // Verify we're logged in by checking for trading interface
+        const loggedIn = await this.verifyLoginSuccess();
+        if (loggedIn) {
+          console.log('[Login] Successfully logged in');
+          return;
+        }
+      } catch (e) {
+        console.error(`[Login] Attempt ${loginAttempt} failed:`, e);
+      }
+
+      if (loginAttempt < this.config.maxLoginRetries!) {
+        console.log(`[Login] Retrying in ${this.config.loginRetryDelay}ms...`);
+        await this.sleep(this.config.loginRetryDelay!);
+      }
+    }
+
+    throw new Error(`Failed to login after ${this.config.maxLoginRetries} attempts`);
+  }
+
+  private async verifyLoginSuccess(): Promise<boolean> {
+    if (!this.page) return false;
+    
+    try {
+      // Check for trading interface elements that indicate successful login
+      const indicators = [
+        'canvas',
+        '.chart-container',
+        '.trading-chart',
+        '[class*="chart"]',
+        'button:has-text("Trade")',
+        'button:has-text("Start")'
+      ];
+
+      for (const selector of indicators) {
+        const element = await this.page!.waitForSelector(selector, { timeout: 3000 }).catch(() => null);
+        if (element) {
+          console.log('[Login] Verified: Found trading interface element:', selector);
+          return true;
+        }
+      }
+    } catch (e) {
+      // Ignore verification errors
+    }
+    return false;
+  }
+
   private async extractAuthFromBrowser(): Promise<void> {
-    if (!this.page || !this.context) return;
+    if (!this.page || !this.context) {
+      console.error('[Auth] Cannot extract auth: page or context not initialized');
+      return;
+    }
 
     try {
+      console.log('[Auth] Extracting authentication from browser...');
+      
       const cookies = await this.context.cookies();
       const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+      console.log('[Auth] Cookies count:', cookies.length);
 
-const token = await this.page.evaluate(() => {
+      // Extract token from multiple possible storage locations
+      const token = await this.page.evaluate(() => {
         return localStorage.getItem('token') || 
                localStorage.getItem('token_demo') || 
                sessionStorage.getItem('token') ||
                document.cookie.split('; ').find((c: string) => c.startsWith('token='))?.split('=')[1];
       });
 
+      // Extract user ID from multiple possible storage locations
       const userId = await this.page.evaluate(() => {
         return localStorage.getItem('user_id') || 
                localStorage.getItem('user_id_demo') || 
@@ -407,12 +515,21 @@ const token = await this.page.evaluate(() => {
 
       const isDemo = this.config.isDemo;
 
+      console.log('[Auth] Token found:', token ? 'YES (length: ' + token.length + ')' : 'NO');
+      console.log('[Auth] User ID found:', userId ? 'YES (' + userId + ')' : 'NO');
+
       if (token && userId) {
         this.authPayload = { token, userId, isDemo, platform: 'web', timestamp: Date.now() };
-        console.log('[Auth] Extracted from browser:', { token: token.substring(0, 20) + '...', userId });
+        console.log('[Auth] Successfully extracted auth payload from browser');
+      } else {
+        const missing = [];
+        if (!token) missing.push('token');
+        if (!userId) missing.push('userId');
+        throw new Error(`Missing authentication data from browser: ${missing.join(', ')}. Page may not be fully loaded or login failed.`);
       }
     } catch (e) {
-      console.error('[Auth] Failed to extract from browser:', e);
+      console.error('[Auth] Failed to extract authentication from browser:', e);
+      throw e;
     }
   }
 

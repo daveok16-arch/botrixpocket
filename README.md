@@ -50,8 +50,6 @@ TELEGRAM_CHAT_ID=your_chat_id
 # Pocket Option (for live mode)
 POCKET_EMAIL=your_email
 POCKET_PASSWORD=your_password
-POCKET_TOKEN=your_token
-POCKET_USER_ID=your_user_id
 ```
 
 ## Configuration
