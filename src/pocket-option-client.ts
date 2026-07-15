@@ -101,6 +101,7 @@ export class PocketOptionClient extends EventEmitter {
   private tlsStartTime: number = 0;
   private firstByteTime: number = 0;
   private redirectChain: string[] = [];
+  private lastCaptchaCheck: any = null;
 
   constructor(config: PocketOptionConfig) {
     super();
@@ -311,16 +312,44 @@ export class PocketOptionClient extends EventEmitter {
 
     await this.page.route('**/*', (route) => {
       const url = route.request().url().toLowerCase();
+      const resourceType = route.request().resourceType();
+      
+      // CRITICAL: Never block Pocket Option's own resources or WebSocket-related requests
+      const pocketOptionPatterns = [
+        'pocketoption.com',
+        'socket.io',
+        'engine.io',
+        'pocket-option',
+        '/api/',
+        '/ws',
+        '/wss'
+      ];
+      
+      const isPocketOption = pocketOptionPatterns.some(p => route.request().url().toLowerCase().includes(p));
+      const isDocument = route.request().resourceType() === 'document';
+      const isScript = route.request().resourceType() === 'script';
+      const isStylesheet = route.request().resourceType() === 'stylesheet';
+      const isXHR = route.request().resourceType() === 'xhr';
+      const isFetch = route.request().resourceType() === 'fetch';
+      const isWebSocket = route.request().resourceType() === 'websocket';
+      
+      // NEVER block Pocket Option resources or critical resource types
+      if (isPocketOption || isDocument || isScript || isStylesheet || isXHR || isFetch || isWebSocket) {
+        route.continue();
+        return;
+      }
+
       const shouldBlock = blockPatterns.some(pattern => url.includes(pattern));
 
       if (shouldBlock) {
+        console.log('[Request Blocked] Blocked tracking resource:', route.request().url());
         route.abort('blockedbyclient');
       } else {
         route.continue();
       }
     });
 
-    console.log('[Browser] Request interception enabled - blocking analytics/tracking');
+    console.log('[Browser] Request interception enabled - blocking analytics/tracking (Pocket Option resources allowed)');
   }
 
   private async captureWebSocketEndpoint(): Promise<void> {
@@ -331,10 +360,11 @@ export class PocketOptionClient extends EventEmitter {
 
       this.page!.on('websocket', ws => {
         const url = ws.url();
-        console.log('[WS Capture] WebSocket detected:', url);
+        console.log('[Phase 4] WebSocket detected:', url);
         if (url.includes('socket.io') || url.includes('engine.io') || url.includes('pocketoption') || url.includes('wss://')) {
           clearTimeout(timeout);
-          console.log('[WS Capture] WebSocket URL captured:', url);
+          console.log('[Phase 4] WebSocket URL captured:', url);
+          (window as any).__WEBSOCKET_CREATED = true;
           resolve(url);
         }
       });
@@ -365,7 +395,7 @@ export class PocketOptionClient extends EventEmitter {
     let lastError: Error | null = null;
 
     for (const demoUrl of urlsToTry) {
-      console.log(`[Browser] Trying URL: ${demoUrl}`);
+      console.log(`[Phase 1] Trying URL: ${demoUrl}`);
       
       try {
         // Reset diagnostics for each attempt
@@ -374,8 +404,11 @@ export class PocketOptionClient extends EventEmitter {
         // Try navigation with instrumentation
         await this.navigateWithInstrumentation(demoUrl);
         
-        // Wait for page to be ready
+        // Phase 2: Wait for page ready
         await this.waitForPageReady();
+
+        // Phase 3: Wait for trading app initialization
+        await this.waitForTradingAppInit();
 
         // If we have credentials and not demo, login
         if (this.config.email && this.config.password && !this.config.isDemo) {
@@ -384,10 +417,10 @@ export class PocketOptionClient extends EventEmitter {
         }
 
         // Wait for WebSocket to be established
-        console.log('[Browser] Waiting for WebSocket connection...');
+        console.log('[Phase 4] Waiting for WebSocket connection...');
         const capturedWsUrl = await wsUrlPromise;
         this.wsUrl = this.extractWebSocketUrl(capturedWsUrl);
-        console.log('[WS] Final WebSocket URL:', this.wsUrl);
+        console.log('[Phase 4] Final WebSocket URL:', this.wsUrl);
         wsCaptured = true;
         break;
 
@@ -413,8 +446,9 @@ export class PocketOptionClient extends EventEmitter {
   private async navigateWithInstrumentation(url: string): Promise<void> {
     if (!this.page) throw new Error('Page not initialized');
     
-    console.log(`[Browser] Navigating to: ${url}`);
-    console.log('[Browser] Using commit -> load -> domcontentloaded navigation strategy');
+    console.log(`[Navigation] ===== PHASE 1: INITIAL NAVIGATION =====`);
+    console.log(`[Navigation] Target URL: ${url}`);
+    console.log('[Navigation] Using commit -> load -> domcontentloaded navigation strategy');
     
     // Reset timing for this navigation
     this.requestStartTime = Date.now();
@@ -428,7 +462,7 @@ export class PocketOptionClient extends EventEmitter {
       requestStartTimes.set(url, Date.now());
       
       if (this.config.debugNavigation) {
-        console.log(`[Navigation] Request: ${request.method()} ${url}`);
+        console.log(`[Navigation] Request: ${request.method()} ${url} (${request.resourceType()})`);
       }
     });
 
@@ -514,6 +548,9 @@ export class PocketOptionClient extends EventEmitter {
       console.log(`[Navigation] Final URL: ${finalUrl}`);
       console.log(`[Navigation] Redirect chain: ${this.redirectChain.join(' -> ') || 'none'}`);
 
+      // CRITICAL: Check for CAPTCHA/challenge pages after navigation
+      await this.detectCaptchaAndChallengePages();
+      
       // Capture screenshot and HTML for diagnostics
       await this.captureDiagnostics();
 
@@ -577,7 +614,7 @@ export class PocketOptionClient extends EventEmitter {
         
         return {
           isCloudflare: html.includes('cloudflare') || html.includes('__cf_') || document.title.includes('Cloudflare'),
-          isCaptcha: html.includes('captcha') || document.querySelector('iframe[src*="captcha"]') !== null || document.querySelector('[id*="captcha"]') !== null,
+          isCaptcha: html.includes('captcha') || document.querySelector('iframe[src*="captcha"]') !== null || document.querySelector('[id*="captcha"]') !== null || document.querySelector('[data-sitekey]') !== null,
           is403: document.body?.innerText.includes('403') || document.title.includes('403'),
           is429: document.body?.innerText.includes('429') || document.title.includes('429'),
           isBlocked: body.includes('blocked') || body.includes('access denied') || body.includes('unusual traffic'),
@@ -588,6 +625,7 @@ export class PocketOptionClient extends EventEmitter {
         };
       });
 
+      this.lastCaptchaCheck = checks;
       console.log('[Anti-Bot Check]:', JSON.stringify(checks, null, 2));
       
       if (checks.isCloudflare) {
@@ -610,6 +648,92 @@ export class PocketOptionClient extends EventEmitter {
     }
   }
 
+  private async detectCaptchaAndChallengePages(): Promise<void> {
+    if (!this.page) return;
+    
+    console.log('[Navigation] ===== PHASE 2: CAPTCHA/CHALLENGE DETECTION =====');
+    
+    try {
+      const checks = await this.page.evaluate(() => {
+        const html = document.documentElement.outerHTML;
+        const body = document.body?.innerText || '';
+        const scripts = Array.from(document.querySelectorAll('script')).map(s => s.src).filter(Boolean);
+        
+        return {
+          // CAPTCHA detection
+          hasRecaptcha: document.querySelector('iframe[src*="recaptcha"]') !== null ||
+                       document.querySelector('[data-sitekey]') !== null ||
+                       html.includes('recaptcha') || html.includes('grecaptcha'),
+          hasHCaptcha: html.includes('hcaptcha') || document.querySelector('iframe[src*="hcaptcha"]') !== null,
+          hasTurnstile: html.includes('turnstile') || document.querySelector('[data-sitekey*="turnstile"]') !== null,
+          
+          // Challenge pages
+          isCloudflare: document.documentElement.outerHTML.includes('cloudflare') || 
+                       document.title.includes('Cloudflare') ||
+                       document.querySelector('meta[name="cf-ray"]') !== null,
+          isChallengePage: document.body?.innerText.includes('challenge') ||
+                          document.title.includes('Challenge') ||
+                          document.title.includes('Cloudflare') ||
+                          document.body?.innerText.includes('Checking your browser') ||
+                          document.body?.innerText.includes('Please wait'),
+          
+          // HTTP errors
+          is403: document.body?.innerText.includes('403') || document.title.includes('403'),
+          is429: document.body?.innerText.includes('429') || document.title.includes('429'),
+          
+          // Generic blocking
+          isBlocked: document.body?.innerText.includes('blocked') || 
+                    document.body?.innerText.includes('access denied') || 
+                    document.body?.innerText.includes('unusual traffic') ||
+                    document.body?.innerText.includes('automated'),
+          
+          // JavaScript frameworks
+          hasReact: typeof (window as any).React !== 'undefined' || document.querySelector('[data-reactroot]') !== null,
+          hasVue: typeof (window as any).Vue !== 'undefined' || document.querySelector('[data-v-]') !== null,
+          
+          // Socket.IO/Engine.IO
+          hasSocketIO: typeof (window as any).io !== 'undefined',
+          hasEngineIO: typeof (window as any).eio !== 'undefined',
+          
+          // Page state
+          title: document.title,
+          url: window.location.href,
+          readyState: document.readyState,
+          bodyLength: document.body?.innerText?.length || 0,
+          scriptCount: document.scripts.length,
+          
+          // External scripts loaded
+          externalScripts: Array.from(document.querySelectorAll('script[src]')).map(s => (s as HTMLScriptElement).src)
+        };
+      });
+
+      console.log('[CAPTCHA/Challenge Detection]:', JSON.stringify(checks, null, 2));
+      
+      // Log critical findings
+      if (checks.isCloudflare) console.warn('[CAPTCHA] Cloudflare challenge detected!');
+      if (checks.hasRecaptcha) console.warn('[CAPTCHA] reCAPTCHA detected!');
+      if (checks.hasHCaptcha) console.warn('[CAPTCHA] hCaptcha detected!');
+      if (checks.hasTurnstile) console.warn('[CAPTCHA] Turnstile detected!');
+      if (checks.isChallengePage) console.warn('[CAPTCHA] Challenge page detected!');
+      if (checks.is403) console.warn('[CAPTCHA] 403 Forbidden!');
+      if (checks.is429) console.warn('[CAPTCHA] 429 Rate Limited!');
+      if (checks.isBlocked) console.warn('[CAPTCHA] Possible blocking detected!');
+      
+      // Check for Pocket Option app initialization
+      if (checks.hasSocketIO || checks.hasReact || checks.hasVue) {
+        console.log('[App Init] Pocket Option application scripts detected');
+      } else {
+        console.warn('[App Init] Pocket Option application NOT detected - CAPTCHA/challenge likely blocking');
+      }
+      
+      // Store for later use
+      this.lastCaptchaCheck = checks;
+
+    } catch (e) {
+      console.log('[CAPTCHA Detection] Error:', (e as Error).message);
+    }
+  }
+
   private async captureDiagnostics(): Promise<void> {
     if (!this.page) return;
     
@@ -627,7 +751,12 @@ export class PocketOptionClient extends EventEmitter {
       const html = await this.page.content();
       const htmlPath = `/tmp/pocketoption-diagnostic-${Date.now()}.html`;
       fs.writeFileSync(htmlPath, html);
-      console.log(`[Diagnostics] HTML saved: ${htmlPath}`);
+      console.log(`[Diagnostics] HTML saved: ${htmlPath} (${html.length} bytes)`);
+
+      // Include CAPTCHA check info
+      if (this.lastCaptchaCheck) {
+        console.log('[Diagnostics] CAPTCHA check:', JSON.stringify(this.lastCaptchaCheck, null, 2));
+      }
 
     } catch (e) {
       console.error('[Diagnostics] Error capturing diagnostics:', (e as Error).message);
@@ -637,12 +766,12 @@ export class PocketOptionClient extends EventEmitter {
   private async waitForPageReady(): Promise<void> {
     if (!this.page) return;
 
-    console.log('[Browser] Waiting for document ready and localStorage...');
+    console.log('[Phase 2] Waiting for document ready and localStorage...');
 
     try {
       // Wait for document ready state
       await this.page.waitForFunction(() => document.readyState === 'complete', { timeout: 30000 });
-      console.log('[Browser] Document readyState: complete');
+      console.log('[Phase 2] Document readyState: complete');
 
       // Wait for localStorage to be accessible and have token
       await this.page.waitForFunction(() => {
@@ -653,7 +782,7 @@ export class PocketOptionClient extends EventEmitter {
           return false;
         }
       }, { timeout: 30000 });
-      console.log('[Browser] localStorage/sessionStorage token found');
+      console.log('[Phase 2] localStorage/sessionStorage token found');
 
       // Wait for body to be present
       await this.page.waitForSelector('body', { timeout: 10000 });
@@ -661,9 +790,46 @@ export class PocketOptionClient extends EventEmitter {
     } catch (e) {
       // Log diagnostic info on failure
       const diag = await this.collectDiagnosticInfo();
-      console.error('[Browser] waitForPageReady failed:', e);
-      console.error('[Browser] Diagnostic info:', JSON.stringify(diag, null, 2));
+      console.error('[Phase 2] waitForPageReady failed:', e);
+      console.error('[Phase 2] Diagnostic info:', JSON.stringify(diag, null, 2));
       throw e;
+    }
+  }
+
+  private async waitForTradingAppInit(): Promise<void> {
+    if (!this.page) return;
+
+    console.log('[Phase 3] Waiting for trading application initialization...');
+
+    try {
+      // Wait for Socket.IO or Engine.IO scripts to load
+      console.log('[Phase 3] Waiting for Socket.IO/Engine.IO scripts...');
+      await this.page.waitForFunction(() => {
+        return typeof (window as any).io !== 'undefined' || 
+               typeof (window as any).eio !== 'undefined' ||
+               document.querySelector('script[src*="socket.io"]') !== null ||
+               document.querySelector('script[src*="engine.io"]') !== null;
+      }, { timeout: 60000 });
+      console.log('[Phase 3] Socket.IO/Engine.IO scripts loaded');
+
+      // Wait for Pocket Option app to initialize (look for trading interface or WebSocket creation)
+      console.log('[Phase 3] Waiting for trading interface or WebSocket initialization...');
+      await Promise.race([
+        this.page.waitForSelector('canvas, .chart-container, .trading-chart, [class*="chart"]', { timeout: 30000 }),
+        this.page.waitForFunction(() => {
+          // Check if WebSocket was created by the page
+          return (window as any).__WEBSOCKET_CREATED === true ||
+                 (window as any).__POCKET_OPTION_INITIALIZED === true;
+        }, { timeout: 30000 })
+      ]).catch(() => {
+        console.log('[Phase 3] Trading interface/WS initialization timeout - continuing anyway');
+      });
+
+      console.log('[Phase 3] Trading application initialization complete');
+
+    } catch (e) {
+      console.error('[Phase 3] waitForTradingAppInit failed:', (e as Error).message);
+      // Don't throw - continue and let WebSocket capture attempt
     }
   }
 
