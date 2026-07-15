@@ -1,8 +1,6 @@
 import { WebSocket } from 'ws';
 import { EventEmitter } from 'events';
-import { Page, Browser, chromium, BrowserContext, Request } from 'playwright';
-import * as fs from 'fs';
-import * as path from 'path';
+import { Page, Browser, chromium, BrowserContext, Route, Request, Response, Frame } from 'playwright';
 
 export interface AssetData {
   asset: string;
@@ -30,16 +28,12 @@ export interface PocketOptionConfig {
   headless?: boolean;
   slowMo?: number;
   mockMode?: boolean;
-  // Auth retry configuration
   maxLoginRetries?: number;
   maxAuthRetries?: number;
   loginRetryDelay?: number;
   authRetryDelay?: number;
-  // Debug configuration
-  debugDir?: string;
-  saveDebugArtifacts?: boolean;
   navigationTimeout?: number;
-  authTimeout?: number;
+  debugNavigation?: boolean;
 }
 
 export interface WsMessage {
@@ -48,6 +42,35 @@ export interface WsMessage {
   sid?: string;
   pingInterval?: number;
   pingTimeout?: number;
+}
+
+interface NavigationTiming {
+  dnsLookup: number;
+  tcpConnect: number;
+  tlsHandshake: number;
+  firstByte: number;
+  responseHeaders: number;
+  totalTime: number;
+  httpStatus: number;
+  redirectChain: string[];
+}
+
+interface NavigationDiagnostics {
+  timing: NavigationTiming;
+  redirects: string[];
+  finalUrl: string;
+  httpStatus: number;
+  contentLength: number;
+  contentType: string;
+  isCloudflare: boolean;
+  isCaptcha: boolean;
+  is403: boolean;
+  is429: boolean;
+  htmlLength: number;
+  screenshotPath?: string;
+  htmlPath?: string;
+  errors: string[];
+  consoleLogs: string[];
 }
 
 export class PocketOptionClient extends EventEmitter {
@@ -69,6 +92,15 @@ export class PocketOptionClient extends EventEmitter {
   private maxReconnectAttempts = 10;
   private reconnectDelay = 5000;
   private config: PocketOptionConfig;
+  private mockTickInterval: NodeJS.Timeout | null = null;
+  private basePrices: Map<string, number> = new Map();
+  private navigationDiagnostics: NavigationDiagnostics | null = null;
+  private requestStartTime: number = 0;
+  private dnsStartTime: number = 0;
+  private tcpStartTime: number = 0;
+  private tlsStartTime: number = 0;
+  private firstByteTime: number = 0;
+  private redirectChain: string[] = [];
 
   constructor(config: PocketOptionConfig) {
     super();
@@ -86,28 +118,17 @@ export class PocketOptionClient extends EventEmitter {
       maxAuthRetries: config.maxAuthRetries ?? 3,
       loginRetryDelay: config.loginRetryDelay ?? 5000,
       authRetryDelay: config.authRetryDelay ?? 3000,
-      debugDir: config.debugDir ?? '/tmp/debug',
-      saveDebugArtifacts: config.saveDebugArtifacts ?? true,
       navigationTimeout: config.navigationTimeout ?? 120000,
-      authTimeout: config.authTimeout ?? 60000
+      debugNavigation: config.debugNavigation ?? true
     };
     this.assets = this.config.assets || ['EUR/USD OTC'];
-    this.setupDebugDirectory();
-  }
-
-  private setupDebugDirectory(): void {
-    if (this.config.saveDebugArtifacts && this.config.debugDir) {
-      try {
-        fs.mkdirSync(this.config.debugDir, { recursive: true });
-        console.log('[Debug] Debug directory created:', this.config.debugDir);
-      } catch (e) {
-        console.error('[Debug] Failed to create debug directory:', e);
-      }
-    }
   }
 
   async initialize(): Promise<void> {
     console.log('[Init] Config mockMode:', this.config.mockMode);
+    console.log('[Init] Config debugNavigation:', this.config.debugNavigation);
+    console.log('[Init] Config navigationTimeout:', this.config.navigationTimeout);
+    
     if (this.config.mockMode) {
       console.log('[Mock Mode] Starting mock WebSocket client...');
       this.connected = true;
@@ -129,33 +150,126 @@ export class PocketOptionClient extends EventEmitter {
   }
 
   private async launchBrowser(): Promise<void> {
+    console.log('[Browser] Launching Chromium with stealth configuration...');
+    
+    const launchArgs = [
+      '--disable-blink-features=AutomationControlled',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-site-isolation-trials',
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-features=TranslateUI',
+      '--disable-ipc-flooding-protection',
+      '--window-size=1920,1080',
+      '--start-maximized',
+      '--force-device-scale-factor=1',
+      '--disable-extensions',
+      '--disable-component-extensions-with-background-pages',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-infobars',
+      '--disable-notifications',
+      '--disable-popup-blocking',
+      '--disable-default-apps',
+      '--hide-scrollbars',
+      '--mute-audio',
+      '--disable-breakpad',
+      '--disable-component-update',
+      '--disable-domain-reliability',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--no-report-upload',
+      '--disable-background-networking',
+      '--disable-client-side-phishing-detection',
+      '--disable-hang-monitor',
+      '--disable-prompt-on-repost',
+      '--disable-domain-reliability',
+      '--disable-component-extensions-with-background-pages',
+      '--enable-features=NetworkService,NetworkServiceInProcess',
+      '--disable-features=NetworkService',
+      '--disable-features=NetworkServiceInProcess'
+    ];
+
     this.browser = await chromium.launch({
       headless: this.config.headless ?? true,
       slowMo: this.config.slowMo ?? 0,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-site-isolation-trials',
-        '--disable-dev-shm-usage',
-        '--no-sandbox',
-        '--disable-setuid-sandbox'
-      ]
+      args: launchArgs
     });
+
+    console.log('[Browser] Chromium launched successfully');
 
     this.context = await this.browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       viewport: { width: 1920, height: 1080 },
+      deviceScaleFactor: 1,
+      isMobile: false,
+      hasTouch: false,
       locale: 'en-US',
       timezoneId: 'America/New_York',
       permissions: ['geolocation'],
-      ignoreHTTPSErrors: true
+      ignoreHTTPSErrors: true,
+      javaScriptEnabled: true,
+      bypassCSP: true,
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-User': '?1',
+        'Sec-Fetch-Dest': 'document',
+        'Cache-Control': 'max-age=0'
+      }
     });
 
+    console.log('[Browser] Context created with stealth configuration');
+
+    // Anti-detection scripts
     this.context.addInitScript(() => {
+      // Hide webdriver property
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      
+      // Mock plugins
+      Object.defineProperty(navigator, 'plugins', { 
+        get: () => [
+          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+          { name: 'Native Client', filename: 'internal-nacl-plugin' }
+        ] 
+      });
+      
+      // Mock languages
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      
+      // Mock platform
+      Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+      
+      // Mock hardware concurrency
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+      
+      // Mock device memory
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+      
+      // Mock screen
+      Object.defineProperty(screen, 'width', { get: () => 1920 });
+      Object.defineProperty(screen, 'height', { get: () => 1080 });
+      Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+      Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+      Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+      Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+      
+      // Remove automation indicators
+      delete (window as any).__webdriverAsyncExecutor;
+      delete (window as any).__webdriverScriptFn;
+      delete (window as any).__webdriverTestRunner;
     });
 
     this.page = await this.context.newPage();
@@ -240,31 +354,284 @@ export class PocketOptionClient extends EventEmitter {
       });
     });
 
-    const demoUrl = this.config.isDemo 
-      ? 'https://pocketoption.com/en/demo/' 
-      : 'https://pocketoption.com/en/login/';
+    // Try multiple URLs in order of preference
+    const urlsToTry = [
+      'https://pocketoption.com/en/',
+      'https://pocketoption.com/en/demo/',
+      'https://pocketoption.com/en/login/'
+    ];
 
-    console.log('[Browser] Navigating to:', demoUrl);
-    // Use domcontentloaded - faster and more reliable than networkidle
-    await this.page!.goto(demoUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    let wsCaptured = false;
+    let lastError: Error | null = null;
 
-    // Wait for document ready and critical elements
-    await this.waitForPageReady();
+    for (const demoUrl of urlsToTry) {
+      console.log(`[Browser] Trying URL: ${demoUrl}`);
+      
+      try {
+        // Reset diagnostics for each attempt
+        this.redirectChain = [];
+        
+        // Try navigation with instrumentation
+        await this.navigateWithInstrumentation(demoUrl);
+        
+        // Wait for page to be ready
+        await this.waitForPageReady();
 
-    if (this.config.email && this.config.password && !this.config.isDemo) {
-      await this.performLogin();
-      await this.waitForPageReady();
+        // If we have credentials and not demo, login
+        if (this.config.email && this.config.password && !this.config.isDemo) {
+          await this.performLogin();
+          await this.waitForPageReady();
+        }
+
+        // Wait for WebSocket to be established
+        console.log('[Browser] Waiting for WebSocket connection...');
+        const capturedWsUrl = await wsUrlPromise;
+        this.wsUrl = this.extractWebSocketUrl(capturedWsUrl);
+        console.log('[WS] Final WebSocket URL:', this.wsUrl);
+        wsCaptured = true;
+        break;
+
+      } catch (e) {
+        lastError = e as Error;
+        console.error(`[Navigation] Failed for ${demoUrl}:`, (e as Error).message);
+        console.log('[Navigation] Trying next URL...');
+        
+        // Brief pause before retry
+        await this.page!.waitForTimeout(3000);
+      }
     }
 
-    console.log('[Browser] Waiting for trading interface to load...');
-    await this.waitForTradingInterface();
+    if (!wsCaptured) {
+      // Final diagnostic capture
+      const diag = await this.collectDiagnosticInfo();
+      console.error('[Browser] All navigation attempts failed');
+      console.error('[Browser] Final diagnostic:', JSON.stringify(diag, null, 2));
+      throw new Error(`Failed to capture WebSocket after trying all URLs. Last error: ${lastError?.message}`);
+    }
+  }
 
-    // Wait for WebSocket to be established
-    await this.page!.waitForTimeout(10000);
+  private async navigateWithInstrumentation(url: string): Promise<void> {
+    if (!this.page) throw new Error('Page not initialized');
+    
+    console.log(`[Browser] Navigating to: ${url}`);
+    console.log('[Browser] Using commit -> load -> domcontentloaded navigation strategy');
+    
+    // Reset timing for this navigation
+    this.requestStartTime = Date.now();
+    this.redirectChain = [];
+    
+    // Set up comprehensive event logging
+    const requestStartTimes = new Map<string, number>();
+    
+    this.page!.on('request', request => {
+      const url = request.url();
+      requestStartTimes.set(url, Date.now());
+      
+      if (this.config.debugNavigation) {
+        console.log(`[Navigation] Request: ${request.method()} ${url}`);
+      }
+    });
 
-    const capturedWsUrl = await wsUrlPromise;
-    this.wsUrl = this.extractWebSocketUrl(capturedWsUrl);
-    console.log('[WS] Final WebSocket URL:', this.wsUrl);
+    this.page!.on('response', response => {
+      const url = response.url();
+      const startTime = requestStartTimes.get(url) || 0;
+      const duration = Date.now() - startTime;
+      
+      if (this.config.debugNavigation) {
+        console.log(`[Navigation] Response: ${response.status()} ${url} (${duration}ms)`);
+      }
+      
+      // Track redirects
+      if (response.status() >= 300 && response.status() < 400) {
+        const redirectUrl = response.headers()['location'];
+        if (redirectUrl) {
+          this.redirectChain.push(redirectUrl);
+          console.log(`[Navigation] Redirect: ${response.status()} -> ${redirectUrl}`);
+        }
+      }
+    });
+
+    this.page!.on('requestfailed', request => {
+      console.error(`[Navigation] Request failed: ${request.method()} ${request.url()} - ${request.failure()?.errorText}`);
+    });
+
+    this.page!.on('framenavigated', frame => {
+      console.log(`[Navigation] Frame navigated: ${frame.url()}`);
+    });
+
+    this.page!.on('console', msg => {
+      if (this.config.debugNavigation) {
+        console.log('[Browser Console]', msg.text());
+      }
+    });
+
+    this.page!.on('pageerror', err => {
+      console.error('[Browser Page Error]', err.message);
+    });
+
+    // Capture timing data
+    this.requestStartTime = Date.now();
+    this.dnsStartTime = Date.now();
+
+    try {
+      // Try multiple waitUntil strategies in order of robustness
+      const waitStrategies: Array<'commit' | 'load' | 'domcontentloaded'> = ['commit', 'load', 'domcontentloaded'];
+      let navigationSuccess = false;
+      let lastError: Error | null = null;
+
+      for (const waitUntil of waitStrategies) {
+        try {
+          console.log(`[Navigation] Attempting with waitUntil: ${waitUntil}`);
+          
+          const response = await this.page!.goto(url, { 
+            waitUntil, 
+            timeout: this.config.navigationTimeout 
+          });
+
+          if (response) {
+            const timing = await this.captureTimingMetrics(response);
+            this.logNavigationTiming(timing);
+            
+            // Check for anti-bot challenges
+            await this.detectAntiBotChallenges();
+            
+            navigationSuccess = true;
+            console.log(`[Navigation] Success with ${waitUntil}: ${response.status()} ${response.url()}`);
+            break;
+          }
+        } catch (e) {
+          lastError = e as Error;
+          console.log(`[Navigation] ${waitUntil} failed:`, (e as Error).message);
+        }
+      }
+
+      if (!navigationSuccess) {
+        throw lastError || new Error('All navigation strategies failed');
+      }
+
+      // Final URL after all redirects
+      const finalUrl = this.page!.url();
+      console.log(`[Navigation] Final URL: ${finalUrl}`);
+      console.log(`[Navigation] Redirect chain: ${this.redirectChain.join(' -> ') || 'none'}`);
+
+      // Capture screenshot and HTML for diagnostics
+      await this.captureDiagnostics();
+
+    } catch (e) {
+      console.error('[Navigation] Fatal navigation error:', (e as Error).message);
+      await this.captureDiagnostics();
+      throw e;
+    }
+  }
+
+  private async captureTimingMetrics(response: Response): Promise<any> {
+    if (!this.page) return null;
+    
+    try {
+      const timing = await this.page.evaluate(() => {
+        const entries = performance.getEntriesByType('navigation') as PerformanceNavigationTiming[];
+        if (entries.length > 0) {
+          const nav = entries[0];
+          return {
+            dnsLookup: nav.domainLookupEnd - nav.domainLookupStart,
+            tcpConnect: nav.connectEnd - nav.connectStart,
+            tlsHandshake: nav.secureConnectionStart > 0 ? nav.connectEnd - nav.secureConnectionStart : 0,
+            firstByte: nav.responseStart - nav.requestStart,
+            responseHeaders: nav.responseEnd - nav.responseStart,
+            totalTime: nav.loadEventEnd - nav.fetchStart,
+            httpStatus: 0, // Not available in Navigation Timing API
+            redirectCount: performance.navigation?.redirectCount || 0
+          };
+        }
+        return null;
+      });
+      return timing;
+    } catch (e) {
+      return { error: String(e) };
+    }
+  }
+
+  private logNavigationTiming(timing: any): void {
+    if (!timing || timing.error) {
+      console.log('[Navigation] Timing unavailable:', timing?.error);
+      return;
+    }
+    
+    console.log('[Navigation] Timing Metrics:');
+    console.log(`  DNS Lookup: ${timing.dnsLookup}ms`);
+    console.log(`  TCP Connect: ${timing.tcpConnect}ms`);
+    console.log(`  TLS Handshake: ${timing.tlsHandshake}ms`);
+    console.log(`  First Byte: ${timing.firstByte}ms`);
+    console.log(`  Response Headers: ${timing.responseHeaders}ms`);
+    console.log(`  Total Time: ${timing.totalTime}ms`);
+    console.log(`  Redirects: ${timing.redirectCount}`);
+  }
+
+  private async detectAntiBotChallenges(): Promise<void> {
+    if (!this.page) return;
+
+    try {
+      const checks = await this.page.evaluate(() => {
+        const body = document.body?.innerText || '';
+        const html = document.documentElement.outerHTML;
+        
+        return {
+          isCloudflare: html.includes('cloudflare') || html.includes('__cf_') || document.title.includes('Cloudflare'),
+          isCaptcha: html.includes('captcha') || document.querySelector('iframe[src*="captcha"]') !== null || document.querySelector('[id*="captcha"]') !== null,
+          is403: document.body?.innerText.includes('403') || document.title.includes('403'),
+          is429: document.body?.innerText.includes('429') || document.title.includes('429'),
+          isBlocked: body.includes('blocked') || body.includes('access denied') || body.includes('unusual traffic'),
+          title: document.title,
+          url: window.location.href,
+          readyState: document.readyState,
+          bodyLength: document.body?.innerText?.length || 0
+        };
+      });
+
+      console.log('[Anti-Bot Check]:', JSON.stringify(checks, null, 2));
+      
+      if (checks.isCloudflare) {
+        console.warn('[Anti-Bot] Cloudflare challenge detected!');
+      }
+      if (checks.isCaptcha) {
+        console.warn('[Anti-Bot] CAPTCHA detected!');
+      }
+      if (checks.is403) {
+        console.warn('[Anti-Bot] 403 Forbidden detected!');
+      }
+      if (checks.is429) {
+        console.warn('[Anti-Bot] 429 Rate Limited!');
+      }
+      if (checks.isBlocked) {
+        console.warn('[Anti-Bot] Possible blocking detected!');
+      }
+    } catch (e) {
+      console.log('[Anti-Bot Check] Error:', (e as Error).message);
+    }
+  }
+
+  private async captureDiagnostics(): Promise<void> {
+    if (!this.page) return;
+    
+    try {
+      console.log('[Diagnostics] Capturing page state...');
+      
+      // Screenshot
+      const screenshotBuffer = await this.page.screenshot({ fullPage: true });
+      const fs = require('fs');
+      const screenshotPath = `/tmp/pocketoption-diagnostic-${Date.now()}.png`;
+      fs.writeFileSync(screenshotPath, screenshotBuffer);
+      console.log(`[Diagnostics] Screenshot saved: ${screenshotPath}`);
+
+      // HTML snapshot
+      const html = await this.page.content();
+      const htmlPath = `/tmp/pocketoption-diagnostic-${Date.now()}.html`;
+      fs.writeFileSync(htmlPath, html);
+      console.log(`[Diagnostics] HTML saved: ${htmlPath}`);
+
+    } catch (e) {
+      console.error('[Diagnostics] Error capturing diagnostics:', (e as Error).message);
+    }
   }
 
   private async waitForPageReady(): Promise<void> {
@@ -315,6 +682,7 @@ export class PocketOptionClient extends EventEmitter {
           bodyExists: !!document.body,
           bodyChildren: document.body?.children.length || 0,
           scripts: document.scripts.length,
+          errors: (window as any).__pageErrors || []
         };
 
         // Safe localStorage dump
@@ -873,9 +1241,6 @@ export class PocketOptionClient extends EventEmitter {
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
-
-  private mockTickInterval: NodeJS.Timeout | null = null;
-  private basePrices: Map<string, number> = new Map();
 
   private startMockTicks(): void {
     console.log('[Mock] Starting mock tick generator for assets:', this.assets.join(', '));
