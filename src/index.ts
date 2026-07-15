@@ -6,7 +6,7 @@ const config: BotConfig = {
     assets: ['EUR/USD OTC', 'GBP/USD OTC', 'USD/JPY OTC', 'AUD/USD OTC'],
     headless: true,
     slowMo: 50,
-    mockMode: true
+    mockMode: false
   },
   signalEngine: {
     rsiPeriod: 14,
