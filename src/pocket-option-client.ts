@@ -1,6 +1,8 @@
 import { WebSocket } from 'ws';
 import { EventEmitter } from 'events';
-import { Page, Browser, chromium, BrowserContext } from 'playwright';
+import { Page, Browser, chromium, BrowserContext, Request } from 'playwright';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export interface AssetData {
   asset: string;
@@ -33,6 +35,11 @@ export interface PocketOptionConfig {
   maxAuthRetries?: number;
   loginRetryDelay?: number;
   authRetryDelay?: number;
+  // Debug configuration
+  debugDir?: string;
+  saveDebugArtifacts?: boolean;
+  navigationTimeout?: number;
+  authTimeout?: number;
 }
 
 export interface WsMessage {
@@ -78,9 +85,25 @@ export class PocketOptionClient extends EventEmitter {
       maxLoginRetries: config.maxLoginRetries ?? 3,
       maxAuthRetries: config.maxAuthRetries ?? 3,
       loginRetryDelay: config.loginRetryDelay ?? 5000,
-      authRetryDelay: config.authRetryDelay ?? 3000
+      authRetryDelay: config.authRetryDelay ?? 3000,
+      debugDir: config.debugDir ?? '/tmp/debug',
+      saveDebugArtifacts: config.saveDebugArtifacts ?? true,
+      navigationTimeout: config.navigationTimeout ?? 120000,
+      authTimeout: config.authTimeout ?? 60000
     };
     this.assets = this.config.assets || ['EUR/USD OTC'];
+    this.setupDebugDirectory();
+  }
+
+  private setupDebugDirectory(): void {
+    if (this.config.saveDebugArtifacts && this.config.debugDir) {
+      try {
+        fs.mkdirSync(this.config.debugDir, { recursive: true });
+        console.log('[Debug] Debug directory created:', this.config.debugDir);
+      } catch (e) {
+        console.error('[Debug] Failed to create debug directory:', e);
+      }
+    }
   }
 
   async initialize(): Promise<void> {
@@ -138,13 +161,59 @@ export class PocketOptionClient extends EventEmitter {
     this.page = await this.context.newPage();
     this.page.on('console', msg => console.log('[Browser Console]', msg.text()));
     this.page.on('pageerror', err => console.error('[Browser Error]', err.message));
+
+    // Request interception: abort analytics/tracking requests
+    await this.setupRequestInterception();
+  }
+
+  private async setupRequestInterception(): Promise<void> {
+    if (!this.page) return;
+
+    const blockPatterns = [
+      'googleads',
+      'doubleclick',
+      'facebook.net',
+      'fbcdn.net',
+      'googletagmanager',
+      'gtm.',
+      'analytics',
+      'appsflyer',
+      'googlesyndication',
+      'googletagservices',
+      'adnxs',
+      'adroll',
+      'taboola',
+      'outbrain',
+      'criteo',
+      'hotjar',
+      'mixpanel',
+      'segment',
+      'intercom',
+      'zendesk',
+      'drift',
+      'crisp.chat',
+      'tawk.to'
+    ];
+
+    await this.page.route('**/*', (route) => {
+      const url = route.request().url().toLowerCase();
+      const shouldBlock = blockPatterns.some(pattern => url.includes(pattern));
+
+      if (shouldBlock) {
+        route.abort('blockedbyclient');
+      } else {
+        route.continue();
+      }
+    });
+
+    console.log('[Browser] Request interception enabled - blocking analytics/tracking');
   }
 
   private async captureWebSocketEndpoint(): Promise<void> {
     if (!this.page) throw new Error('Page not initialized');
 
     const wsUrlPromise = new Promise<string>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('WebSocket capture timeout')), 120000);
+      const timeout = setTimeout(() => reject(new Error('WebSocket capture timeout after 120s')), 120000);
 
       this.page!.on('websocket', ws => {
         const url = ws.url();
@@ -176,22 +245,102 @@ export class PocketOptionClient extends EventEmitter {
       : 'https://pocketoption.com/en/login/';
 
     console.log('[Browser] Navigating to:', demoUrl);
-    await this.page!.goto(demoUrl, { waitUntil: 'networkidle', timeout: 90000 });
+    // Use domcontentloaded - faster and more reliable than networkidle
+    await this.page!.goto(demoUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
 
-    await this.page!.waitForTimeout(5000);
+    // Wait for document ready and critical elements
+    await this.waitForPageReady();
 
     if (this.config.email && this.config.password && !this.config.isDemo) {
       await this.performLogin();
+      await this.waitForPageReady();
     }
 
     console.log('[Browser] Waiting for trading interface to load...');
     await this.waitForTradingInterface();
 
-    await this.page!.waitForTimeout(15000);
+    // Wait for WebSocket to be established
+    await this.page!.waitForTimeout(10000);
 
     const capturedWsUrl = await wsUrlPromise;
     this.wsUrl = this.extractWebSocketUrl(capturedWsUrl);
     console.log('[WS] Final WebSocket URL:', this.wsUrl);
+  }
+
+  private async waitForPageReady(): Promise<void> {
+    if (!this.page) return;
+
+    console.log('[Browser] Waiting for document ready and localStorage...');
+
+    try {
+      // Wait for document ready state
+      await this.page.waitForFunction(() => document.readyState === 'complete', { timeout: 30000 });
+      console.log('[Browser] Document readyState: complete');
+
+      // Wait for localStorage to be accessible and have token
+      await this.page.waitForFunction(() => {
+        try {
+          const token = localStorage.getItem('token') || localStorage.getItem('token_demo') || sessionStorage.getItem('token');
+          return !!token;
+        } catch (e) {
+          return false;
+        }
+      }, { timeout: 30000 });
+      console.log('[Browser] localStorage/sessionStorage token found');
+
+      // Wait for body to be present
+      await this.page.waitForSelector('body', { timeout: 10000 });
+      
+    } catch (e) {
+      // Log diagnostic info on failure
+      const diag = await this.collectDiagnosticInfo();
+      console.error('[Browser] waitForPageReady failed:', e);
+      console.error('[Browser] Diagnostic info:', JSON.stringify(diag, null, 2));
+      throw e;
+    }
+  }
+
+  private async collectDiagnosticInfo(): Promise<any> {
+    if (!this.page) return {};
+
+    try {
+      return await this.page.evaluate(() => {
+        const info: any = {
+          readyState: document.readyState,
+          url: window.location.href,
+          title: document.title,
+          localStorage: {},
+          sessionStorage: {},
+          cookies: document.cookie,
+          bodyExists: !!document.body,
+          bodyChildren: document.body?.children.length || 0,
+          scripts: document.scripts.length,
+        };
+
+        // Safe localStorage dump
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key) info.localStorage[key] = localStorage.getItem(key)?.substring(0, 50) + '...';
+          }
+        } catch (e) {
+          info.localStorageError = String(e);
+        }
+
+        try {
+          for (let i = 0; i < sessionStorage.length; i++) {
+            const key = sessionStorage.key(i);
+            if (key) info.sessionStorage[key] = sessionStorage.getItem(key)?.substring(0, 50) + '...';
+          }
+        } catch (e) {
+          info.sessionStorageError = String(e);
+        }
+
+        return info;
+      });
+    } catch (e) {
+      return { error: String(e) };
+    }
   }
 
   private async waitForTradingInterface(): Promise<void> {
