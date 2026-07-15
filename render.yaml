@@ -1,10 +1,9 @@
 services:
   - type: web
     name: pocket-option-bot
-    env: node
+    env: docker
+    dockerfilePath: ./Dockerfile
     plan: free
-    buildCommand: npm install && npx playwright install chromium --with-deps && npm run build
-    startCommand: cd /opt/render/project && node dist/index.js
     envVars:
       - key: NODE_ENV
         value: production
@@ -20,5 +19,5 @@ services:
         sync: false
       - key: POCKET_USER_ID
         sync: false
-    healthCheckPath: /
+    healthCheckPath: /health
     autoDeploy: true
