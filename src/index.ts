@@ -1,4 +1,5 @@
 import { PocketOptionBot, BotConfig } from './bot.js';
+import { createServer } from 'http';
 
 const config: BotConfig = {
   pocketOption: {
@@ -100,6 +101,25 @@ process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down...');
   await bot.stop();
   process.exit(0);
+});
+
+// Start HTTP server for Render health check (free Web Service requirement)
+const PORT = process.env.PORT || 3000;
+createServer((req, res) => {
+  if (req.url === '/' || req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ 
+      status: 'ok', 
+      bot: 'running',
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString()
+    }));
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+}).listen(PORT, () => {
+  console.log(`🌐 Health check server listening on port ${PORT}`);
 });
 
 async function main() {
