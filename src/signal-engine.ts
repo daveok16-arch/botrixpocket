@@ -75,6 +75,8 @@ export interface EngineConfig {
   volatilityWeight: number;
   patternWeight: number;
   srWeight: number;
+  // Pocket Option expiration intervals (in milliseconds)
+  expirations: number[];
 }
 
 const TIMEFRAME_MS: Record<string, number> = {
@@ -107,7 +109,9 @@ const DEFAULT_CONFIG: EngineConfig = {
   momentumWeight: 1.0,
   volatilityWeight: 0.8,
   patternWeight: 1.0,
-  srWeight: 1.0
+  srWeight: 1.0,
+  // Pocket Option expiration intervals: 30s, 1m, 3m, 5m
+  expirations: [30000, 60000, 180000, 300000]
 };
 
 export class CandleBuilder {
@@ -561,15 +565,24 @@ export class SignalEngine extends EventEmitter {
 
     if (confidence < this.config.minConfidence) return null;
 
-    // Determine expiration based on timeframe and confidence
-    // Higher confidence = longer expiration (more time for move to play out)
-    const primaryTimeframe = this.config.timeframes[this.config.timeframes.length - 1];
-    const tfMs = this.getTimeframeMs(primaryTimeframe);
+    // Select expiration from configured intervals based on confidence and signal strength
+    // Higher confidence/strength -> longer expiration
+    const expirations = this.config.expirations || [30000, 60000, 180000, 300000];
     
-    // Base expiration: 2-3 candles of primary timeframe
-    // Adjust by confidence: higher confidence = slightly longer
-    const baseExpirationMultiplier = confidence >= 85 ? 3 : confidence >= 75 ? 2.5 : 2;
-    const expirationMs = Math.round(tfMs * baseExpirationMultiplier);
+    // Determine which expiration tier to use based on confidence
+    // 70-79% -> 30s or 1m
+    // 80-84% -> 1m or 3m
+    // 85-89% -> 3m or 5m
+    // 90%+ -> 5m
+    let expirationIndex: number;
+    if (confidence >= 90) expirationIndex = 3;      // 5m
+    else if (confidence >= 85) expirationIndex = 2;  // 3m
+    else if (confidence >= 80) expirationIndex = 1;  // 1m
+    else expirationIndex = 0;                         // 30s
+
+    // Clamp to available expirations
+    expirationIndex = Math.min(expirationIndex, expirations.length - 1);
+    const expirationMs = expirations[expirationIndex];
     const expirationTime = tick.timestamp + expirationMs;
     const expirationLabel = this.formatExpiration(expirationMs);
 
@@ -587,7 +600,7 @@ export class SignalEngine extends EventEmitter {
       expiry: expirationTime,
       expirationTime: expirationMs,
       expirationLabel,
-      timeframe: primaryTimeframe
+      timeframe: this.config.timeframes[this.config.timeframes.length - 1]
     };
 
     return signal;
